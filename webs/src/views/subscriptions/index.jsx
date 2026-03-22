@@ -127,6 +127,7 @@ export default function SubscriptionList() {
     OnlyNative: false,
     ResidentialType: '',
     IPType: '',
+    QualityStatus: '',
     refreshUsageOnRequest: true // 默认开启实时获取用量信息
   });
 
@@ -311,6 +312,7 @@ export default function SubscriptionList() {
       OnlyNative: false,
       ResidentialType: '',
       IPType: '',
+      QualityStatus: '',
       refreshUsageOnRequest: true
     });
     setNodeGroupFilter('all');
@@ -368,6 +370,7 @@ export default function SubscriptionList() {
       OnlyNative: sub.OnlyNative || false,
       ResidentialType: sub.ResidentialType || (sub.OnlyResidential ? 'residential' : ''),
       IPType: sub.IPType || (sub.OnlyNative ? 'native' : ''),
+      QualityStatus: sub.QualityStatus || '',
       refreshUsageOnRequest: sub.RefreshUsageOnRequest !== false // 默认 true
     });
     setNodeGroupFilter('all');
@@ -443,6 +446,7 @@ export default function SubscriptionList() {
         OnlyNative: formData.IPType === 'native',
         ResidentialType: formData.ResidentialType || '',
         IPType: formData.IPType || '',
+        QualityStatus: formData.QualityStatus || '',
         RefreshUsageOnRequest: formData.refreshUsageOnRequest
       };
 
@@ -594,6 +598,7 @@ export default function SubscriptionList() {
         OnlyNative: formData.IPType === 'native',
         ResidentialType: formData.ResidentialType || '',
         IPType: formData.IPType || '',
+        QualityStatus: formData.QualityStatus || '',
         NodeNamePreprocess: formData.nodeNamePreprocess || '',
         NodeNameRule: formData.nodeNameRule || '',
         DeduplicationRule: formData.deduplicationRule || ''

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sublink/models"
 	"sublink/node/protocol"
 	"sublink/utils"
 	"time"
@@ -233,15 +234,11 @@ func MihomoSpeedTest(
 		}
 	}
 
-	portInt, err := strconv.Atoi(portStr)
+	portUint, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return 0, 0, 0, "", nil, fmt.Errorf("invalid port: %v", err)
 	}
-	// Validate port range to prevent overflow
-	if portInt < 0 || portInt > 65535 {
-		return 0, 0, 0, "", nil, fmt.Errorf("port out of range: %d", portInt)
-	}
-	port := uint16(portInt)
+	port := uint16(portUint)
 
 	metadata := &constant.Metadata{
 		Host:    parsedUrl.Hostname(),
@@ -293,16 +290,11 @@ func MihomoSpeedTest(
 					return nil, fmt.Errorf("split host port error: %v", splitErr)
 				}
 
-				pInt, atoiErr := strconv.Atoi(pStr)
-				if atoiErr != nil {
-					return nil, fmt.Errorf("invalid port string: %v", atoiErr)
+				pUint, parseErr := strconv.ParseUint(pStr, 10, 16)
+				if parseErr != nil {
+					return nil, fmt.Errorf("invalid port string: %v", parseErr)
 				}
-
-				// Validate port range
-				if pInt < 0 || pInt > 65535 {
-					return nil, fmt.Errorf("port out of range: %d", pInt)
-				}
-				p := uint16(pInt)
+				p := uint16(pUint)
 
 				md := &constant.Metadata{
 					Host:    h,
@@ -466,18 +458,14 @@ func fetchLandingIPWithAdapter(proxyAdapter constant.Proxy, ipUrl string) string
 					return nil, splitErr
 				}
 
-				pInt, atoiErr := strconv.Atoi(pStr)
-				if atoiErr != nil {
-					return nil, atoiErr
-				}
-
-				if pInt < 0 || pInt > 65535 {
-					return nil, fmt.Errorf("port out of range: %d", pInt)
+				pUint, parseErr := strconv.ParseUint(pStr, 10, 16)
+				if parseErr != nil {
+					return nil, parseErr
 				}
 
 				md := &constant.Metadata{
 					Host:    h,
-					DstPort: uint16(pInt),
+					DstPort: uint16(pUint),
 					Type:    constant.HTTP,
 				}
 				return proxyAdapter.DialContext(dialCtx, md)
@@ -509,9 +497,111 @@ func fetchLandingIPWithAdapter(proxyAdapter constant.Proxy, ipUrl string) string
 
 // QualityCheckResult 节点质量检测结果
 type QualityCheckResult struct {
-	IsBroadcast   bool `json:"isBroadcast"`
-	IsResidential bool `json:"isResidential"`
-	FraudScore    int  `json:"fraudScore"`
+	IsBroadcast   bool   `json:"isBroadcast"`
+	IsResidential bool   `json:"isResidential"`
+	FraudScore    int    `json:"fraudScore"`
+	Status        string `json:"status"`
+	Family        string `json:"family"`
+	IP            string `json:"ip,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+func fetchQuality(proxyAdapter constant.Proxy, qualityURL string) *QualityCheckResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+				h, pStr, splitErr := net.SplitHostPort(addr)
+				if splitErr != nil {
+					return nil, splitErr
+				}
+				pUint, parseErr := strconv.ParseUint(pStr, 10, 16)
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				md := &constant.Metadata{
+					Host:    h,
+					DstPort: uint16(pUint),
+					Type:    constant.HTTP,
+				}
+				return proxyAdapter.DialContext(dialCtx, md)
+			},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", qualityURL, nil)
+	if err != nil {
+		utils.Debug("节点质量检测: 创建请求失败: %v", err)
+		return &QualityCheckResult{Status: models.QualityStatusFailed, Reason: err.Error()}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		utils.Debug("节点质量检测: 请求失败: %v", err)
+		return &QualityCheckResult{Status: models.QualityStatusFailed, Reason: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		utils.Debug("节点质量检测: 响应状态异常: %d", resp.StatusCode)
+		return &QualityCheckResult{Status: models.QualityStatusFailed, Reason: fmt.Sprintf("status_%d", resp.StatusCode)}
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	if err != nil {
+		utils.Debug("节点质量检测: 读取响应失败: %v", err)
+		return &QualityCheckResult{Status: models.QualityStatusFailed, Reason: err.Error()}
+	}
+
+	utils.Debug("节点质量检测: 响应: %s", string(body))
+
+	var apiResp struct {
+		IP            string `json:"ip"`
+		IsBroadcast   *bool  `json:"isBroadcast"`
+		IsResidential *bool  `json:"isResidential"`
+		FraudScore    *int   `json:"fraudScore"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		utils.Debug("节点质量检测: 解析响应失败: %v", err)
+		return &QualityCheckResult{Status: models.QualityStatusFailed, Reason: "invalid_json"}
+	}
+
+	resultIP := apiResp.IP
+	qualityFamily := ""
+	if parsedIP := net.ParseIP(resultIP); parsedIP != nil {
+		if parsedIP.To4() != nil {
+			qualityFamily = models.QualityFamilyIPv4
+		} else {
+			qualityFamily = models.QualityFamilyIPv6
+		}
+	}
+
+	if apiResp.IsBroadcast == nil || apiResp.IsResidential == nil || apiResp.FraudScore == nil {
+		utils.Debug("节点质量检测: 响应字段缺失")
+		reason := "missing_quality_fields"
+		if qualityFamily == models.QualityFamilyIPv6 {
+			reason = "incomplete_ipv6_info"
+		}
+		return &QualityCheckResult{
+			Status: models.QualityStatusPartial,
+			Family: qualityFamily,
+			IP:     resultIP,
+			Reason: reason,
+		}
+	}
+
+	return &QualityCheckResult{
+		IsBroadcast:   *apiResp.IsBroadcast,
+		IsResidential: *apiResp.IsResidential,
+		FraudScore:    *apiResp.FraudScore,
+		Status:        models.QualityStatusSuccess,
+		Family:        qualityFamily,
+		IP:            resultIP,
+	}
 }
 
 // FetchQualityWithAdapter 通过代理通道检测节点质量
@@ -528,81 +618,5 @@ func FetchQualityWithAdapter(proxyAdapter constant.Proxy, qualityURL string) *Qu
 		qualityURL = "https://my.ippure.com/v1/info"
 	}
 
-	// 固定5秒超时
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// 复用 proxyAdapter 创建 HTTP client
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-				h, pStr, splitErr := net.SplitHostPort(addr)
-				if splitErr != nil {
-					return nil, splitErr
-				}
-				pInt, atoiErr := strconv.Atoi(pStr)
-				if atoiErr != nil {
-					return nil, atoiErr
-				}
-				if pInt < 0 || pInt > 65535 {
-					return nil, fmt.Errorf("port out of range: %d", pInt)
-				}
-				md := &constant.Metadata{
-					Host:    h,
-					DstPort: uint16(pInt),
-					Type:    constant.HTTP,
-				}
-				return proxyAdapter.DialContext(dialCtx, md)
-			},
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 5 * time.Second,
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", qualityURL, nil)
-	if err != nil {
-		utils.Debug("节点质量检测: 创建请求失败: %v", err)
-		return nil
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		utils.Debug("节点质量检测: 请求失败: %v", err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		utils.Debug("节点质量检测: 响应状态异常: %d", resp.StatusCode)
-		return nil
-	}
-
-	// 限制读取最多2KB（API返回的JSON不会太大）
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	if err != nil {
-		utils.Debug("节点质量检测: 读取响应失败: %v", err)
-		return nil
-	}
-
-	// 解析JSON响应
-	var apiResp struct {
-		IsBroadcast   *bool `json:"isBroadcast"`
-		IsResidential *bool `json:"isResidential"`
-		FraudScore    *int  `json:"fraudScore"`
-	}
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		utils.Debug("节点质量检测: 解析响应失败: %v", err)
-		return nil
-	}
-
-	if apiResp.IsBroadcast == nil || apiResp.IsResidential == nil || apiResp.FraudScore == nil {
-		utils.Debug("节点质量检测: 响应字段缺失")
-		return nil
-	}
-
-	return &QualityCheckResult{
-		IsBroadcast:   *apiResp.IsBroadcast,
-		IsResidential: *apiResp.IsResidential,
-		FraudScore:    *apiResp.FraudScore,
-	}
+	return fetchQuality(proxyAdapter, qualityURL)
 }

@@ -168,6 +168,7 @@ export default function NodeList() {
   const [protocolFilter, setProtocolFilter] = useState('');
   const [residentialType, setResidentialType] = useState('');
   const [ipType, setIpType] = useState('');
+  const [qualityStatus, setQualityStatus] = useState('');
 
   // 排序
   const [sortBy, setSortBy] = useState(''); // 'delay' | 'speed' | ''
@@ -282,6 +283,7 @@ export default function NodeList() {
       if (filterParams.protocol) params.protocol = filterParams.protocol;
       if (filterParams.residentialType) params.residentialType = filterParams.residentialType;
       if (filterParams.ipType) params.ipType = filterParams.ipType;
+      if (filterParams.qualityStatus) params.qualityStatus = filterParams.qualityStatus;
       if (filterParams.countries && filterParams.countries.length > 0) {
         params['countries[]'] = filterParams.countries;
       }
@@ -409,6 +411,7 @@ export default function NodeList() {
         protocol: protocolFilter,
         residentialType: residentialType,
         ipType: ipType,
+        qualityStatus: qualityStatus,
         countries: countryFilter,
         tags: tagFilter,
         sortBy: sortBy,
@@ -438,6 +441,7 @@ export default function NodeList() {
     protocolFilter,
     residentialType,
     ipType,
+    qualityStatus,
     countryFilter,
     tagFilter,
     sortBy,
@@ -469,6 +473,7 @@ export default function NodeList() {
     setProtocolFilter('');
     setResidentialType('');
     setIpType('');
+    setQualityStatus('');
     setSortBy('');
     setSortOrder('asc');
   };
@@ -485,6 +490,7 @@ export default function NodeList() {
     protocol: protocolFilter,
     residentialType: residentialType,
     ipType: ipType,
+    qualityStatus: qualityStatus,
     countries: countryFilter,
     tags: tagFilter,
     sortBy: sortBy,
@@ -553,6 +559,7 @@ export default function NodeList() {
     tagFilter,
     residentialType,
     ipType,
+    qualityStatus,
     sortBy,
     sortOrder,
     page,
@@ -942,6 +949,7 @@ export default function NodeList() {
         if (filters.protocol) params.protocol = filters.protocol;
         if (filters.residentialType) params.residentialType = filters.residentialType;
         if (filters.ipType) params.ipType = filters.ipType;
+        if (filters.qualityStatus) params.qualityStatus = filters.qualityStatus;
         if (filters.countries && filters.countries.length > 0) {
           params['countries[]'] = filters.countries;
         }
@@ -1097,6 +1105,8 @@ export default function NodeList() {
         setResidentialType={setResidentialType}
         ipType={ipType}
         setIpType={setIpType}
+        qualityStatus={qualityStatus}
+        setQualityStatus={setQualityStatus}
         countryFilter={countryFilter}
         setCountryFilter={setCountryFilter}
         tagFilter={tagFilter}
