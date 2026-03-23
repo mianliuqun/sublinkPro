@@ -16,9 +16,9 @@ import Tooltip from '@mui/material/Tooltip';
 import LinearProgress from '@mui/material/LinearProgress';
 import Snackbar from '@mui/material/Snackbar';
 import Alert from '@mui/material/Alert';
+import useMediaQuery from '@mui/material/useMediaQuery';
 
 // icons
-import SubscriptionsIcon from '@mui/icons-material/Subscriptions';
 import CloudQueueIcon from '@mui/icons-material/CloudQueue';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
@@ -41,18 +41,19 @@ import SecurityIcon from '@mui/icons-material/Security';
 import MainCard from 'ui-component/cards/MainCard';
 import TaskProgressPanel from 'components/TaskProgressPanel';
 import {
-  getSubTotal,
   getNodeTotal,
   getFastestSpeedNode,
   getLowestDelayNode,
-  getCountryStats,
+  getDashboardCountryStats,
   getProtocolStats,
   getTagStats,
   getGroupStats,
-  getSourceStats
+  getSourceStats,
+  getQualityStats
 } from 'api/total';
 import { getAirports } from 'api/airports';
 import { formatBytes, formatExpireTime, getUsageColor } from 'views/airports/utils';
+import { getQualityStatusMeta } from 'utils/fraudScore';
 
 const getCalmSurface = (theme, accentColor) => {
   const isDark = theme.palette.mode === 'dark';
@@ -91,6 +92,508 @@ const getAccentChipSx = (theme, accentColor) => ({
     bgcolor: alpha(accentColor, theme.palette.mode === 'dark' ? 0.24 : 0.14)
   }
 });
+
+const COUNTRY_FALLBACK_EMOJI = '🌐';
+
+const getFlagEmoji = (countryCode) => {
+  if (!countryCode || countryCode === '未知') return COUNTRY_FALLBACK_EMOJI;
+  const normalizedCode = countryCode.toUpperCase() === 'TW' ? 'CN' : countryCode.toUpperCase();
+  if (normalizedCode.length !== 2) return COUNTRY_FALLBACK_EMOJI;
+  const codePoints = normalizedCode.split('').map((char) => 127397 + char.charCodeAt(0));
+  return String.fromCodePoint(...codePoints);
+};
+
+const protocolColors = {
+  Shadowsocks: ['#3b82f6', '#2563eb'],
+  ShadowsocksR: ['#6366f1', '#4f46e5'],
+  VMess: ['#8b5cf6', '#7c3aed'],
+  VLESS: ['#10b981', '#059669'],
+  Trojan: ['#ef4444', '#dc2626'],
+  Hysteria: ['#06b6d4', '#0891b2'],
+  Hysteria2: ['#14b8a6', '#0d9488'],
+  TUIC: ['#f59e0b', '#d97706'],
+  WireGuard: ['#84cc16', '#65a30d'],
+  NaiveProxy: ['#ec4899', '#db2777'],
+  SOCKS5: ['#64748b', '#475569'],
+  HTTP: ['#94a3b8', '#64748b'],
+  HTTPS: ['#22c55e', '#16a34a']
+};
+
+const fraudLevelColors = {
+  极佳: '#94a3b8',
+  优秀: '#22c55e',
+  良好: '#eab308',
+  中等: '#f97316',
+  差: '#ef4444',
+  极差: '#111827'
+};
+
+const qualityStatusColorMap = {
+  success: '#22c55e',
+  partial: '#0ea5e9',
+  failed: '#ef4444',
+  disabled: '#94a3b8',
+  untested: '#64748b'
+};
+
+const qualityStatusLabelMap = {
+  success: '完整结果',
+  partial: '信息不全',
+  failed: '检测失败',
+  disabled: '未启用',
+  untested: '未检测'
+};
+
+const createCountryStatMap = (stats = []) =>
+  stats.reduce((accumulator, item) => {
+    accumulator[item.country] = item;
+    return accumulator;
+  }, {});
+
+const buildTopItems = (items = [], total = 0, limit = 5, options = {}) => {
+  const { forceCollapsedKeys = [] } = options;
+  const normalizedItems = items.filter((item) => item && item.count > 0);
+  const forcedHiddenItems = normalizedItems.filter((item) => forceCollapsedKeys.includes(item.key));
+  const eligibleVisibleItems = normalizedItems.filter((item) => !forceCollapsedKeys.includes(item.key));
+  const visibleItems = eligibleVisibleItems.slice(0, limit);
+  const hiddenItems = [...forcedHiddenItems, ...eligibleVisibleItems.slice(limit)];
+  const hiddenCount = hiddenItems.reduce((sum, item) => sum + item.count, 0);
+  const hiddenUniqueIpCount = hiddenItems.reduce((sum, item) => sum + (item.uniqueIpCount || 0), 0);
+
+  if (hiddenCount > 0) {
+    visibleItems.push({
+      key: 'collapsed-other',
+      label: `其他 ${hiddenItems.length} 项`,
+      count: hiddenCount,
+      uniqueIpCount: hiddenUniqueIpCount,
+      color: '#94a3b8',
+      tooltip: `包含未展示的其余 ${hiddenItems.length} 项，合计 ${hiddenCount} 个节点`,
+      isCollapsedOther: true,
+      hiddenItems: hiddenItems.map((item) => ({
+        ...item,
+        percent: total > 0 ? (item.count / total) * 100 : 0
+      }))
+    });
+  }
+
+  return visibleItems.map((item) => ({
+    ...item,
+    percent: total > 0 ? (item.count / total) * 100 : 0
+  }));
+};
+
+const normalizeMapStats = ({ entries = [], total, limit, defaultColor, getItemMeta, forceCollapsedKeys = [] }) => {
+  const resolvedTotal = typeof total === 'number' ? total : entries.reduce((sum, [, count]) => sum + count, 0);
+  const normalized = entries
+    .map(([key, count], index) => ({
+      key,
+      label: key,
+      count,
+      color: defaultColor,
+      ...(getItemMeta ? getItemMeta(key, count, index) : {})
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  return buildTopItems(normalized, resolvedTotal, limit, { forceCollapsedKeys });
+};
+
+const normalizeTagStats = ({ tags = [], limit }) => {
+  const total = tags.reduce((sum, item) => sum + item.count, 0);
+  const normalized = [...tags]
+    .sort((a, b) => b.count - a.count)
+    .map((tag) => ({
+      key: tag.name,
+      label: tag.name,
+      count: tag.count,
+      color: tag.color || '#ec4899'
+    }));
+
+  return buildTopItems(normalized, total, limit);
+};
+
+const getProgressBarSx = (theme, color, muted = false) => ({
+  height: 7,
+  borderRadius: 999,
+  bgcolor: alpha(color, theme.palette.mode === 'dark' ? 0.22 : 0.12),
+  '& .MuiLinearProgress-bar': {
+    borderRadius: 999,
+    backgroundColor: muted ? alpha(color, theme.palette.mode === 'dark' ? 0.7 : 0.62) : color
+  }
+});
+
+const StatRowsSkeleton = ({ rows = 5 }) => (
+  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+    {Array.from({ length: rows }).map((_, index) => (
+      <Box key={index}>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.75, gap: 1 }}>
+          <Skeleton variant="text" width="42%" height={24} />
+          <Skeleton variant="text" width={64} height={24} />
+        </Box>
+        <Skeleton variant="rounded" height={8} sx={{ borderRadius: 999 }} />
+      </Box>
+    ))}
+  </Box>
+);
+
+const StatsChartCard = ({ title, icon: Icon, accentColor, summary, loading, tooltip, children }) => {
+  const theme = useTheme();
+
+  return (
+    <Card
+      sx={{
+        ...getCalmSurface(theme, accentColor),
+        borderRadius: 4,
+        height: '100%',
+        overflow: 'hidden',
+        position: 'relative',
+        '&::before': {
+          content: '""',
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          height: 3,
+          backgroundColor: accentColor
+        }
+      }}
+    >
+      <CardContent sx={{ p: 3 }}>
+        <Box sx={{ display: 'flex', alignItems: { xs: 'flex-start', sm: 'center' }, gap: 1.5, mb: 2.5, flexWrap: 'wrap' }}>
+          <Box sx={getAccentIconBox(theme, accentColor)}>
+            <Icon sx={{ fontSize: 22 }} />
+          </Box>
+          <Box sx={{ flex: 1, minWidth: 0 }}>
+            <Typography variant="h5" sx={{ fontWeight: 600 }}>
+              {title}
+            </Typography>
+            {tooltip ? (
+              <Typography variant="body2" sx={{ mt: 0.5, color: 'text.secondary' }}>
+                {tooltip}
+              </Typography>
+            ) : null}
+          </Box>
+          {summary ? (
+            <Box
+              sx={{
+                ml: { xs: 0, sm: 'auto' },
+                px: 1.25,
+                py: 0.75,
+                borderRadius: 2,
+                fontSize: '0.75rem',
+                fontWeight: 700,
+                color: accentColor,
+                bgcolor: alpha(accentColor, theme.palette.mode === 'dark' ? 0.2 : 0.1),
+                border: `1px solid ${alpha(accentColor, theme.palette.mode === 'dark' ? 0.32 : 0.18)}`
+              }}
+            >
+              {summary}
+            </Box>
+          ) : null}
+        </Box>
+
+        {loading ? <StatRowsSkeleton /> : children}
+      </CardContent>
+    </Card>
+  );
+};
+
+const RankedStatList = ({ items = [], emptyText, percentSuffix = '%', valueFormatter, labelFormatter, mutedKeys = [], detailFormatter }) => {
+  const theme = useTheme();
+  const [expandedKeys, setExpandedKeys] = useState({});
+
+  if (!items.length) {
+    return (
+      <Typography color="text.secondary" sx={{ fontSize: '0.875rem' }}>
+        {emptyText}
+      </Typography>
+    );
+  }
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}>
+      {items.map((item) => {
+        const muted = item.isCollapsedOther || mutedKeys.includes(item.key);
+        const isExpanded = Boolean(expandedKeys[item.key]);
+        const toggleExpanded = () => {
+          if (!item.isCollapsedOther) return;
+          setExpandedKeys((prev) => ({ ...prev, [item.key]: !prev[item.key] }));
+        };
+        const content = (
+          <Box key={item.key}>
+            <Box
+              onClick={toggleExpanded}
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 1.5,
+                mb: 0.75,
+                cursor: item.isCollapsedOther ? 'pointer' : 'default'
+              }}
+            >
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, minWidth: 0, flex: 1 }}>
+                {item.marker ? (
+                  <Typography sx={{ fontSize: '1rem', lineHeight: 1 }}>{item.marker}</Typography>
+                ) : (
+                  <Box
+                    sx={{
+                      width: 10,
+                      height: 10,
+                      borderRadius: '50%',
+                      bgcolor: item.color,
+                      flexShrink: 0,
+                      boxShadow: `0 0 0 4px ${alpha(item.color, theme.palette.mode === 'dark' ? 0.18 : 0.12)}`
+                    }}
+                  />
+                )}
+                <Typography
+                  variant="subtitle2"
+                  sx={{
+                    fontWeight: 600,
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap'
+                  }}
+                >
+                  {labelFormatter ? labelFormatter(item, isExpanded) : item.label}
+                </Typography>
+                {item.isCollapsedOther ? (
+                  <Typography variant="caption" sx={{ color: 'text.secondary', flexShrink: 0 }}>
+                    {isExpanded ? '收起' : '展开'}
+                  </Typography>
+                ) : null}
+              </Box>
+              <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75, flexShrink: 0 }}>
+                <Box sx={{ textAlign: 'right' }}>
+                  <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                    {valueFormatter ? valueFormatter(item.count, item) : item.count.toLocaleString()}
+                  </Typography>
+                  {detailFormatter ? (
+                    <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                      {detailFormatter(item)}
+                    </Typography>
+                  ) : null}
+                </Box>
+                <Typography variant="caption" sx={{ color: 'text.secondary', minWidth: 42, textAlign: 'right' }}>
+                  {item.percent.toFixed(1)}{percentSuffix}
+                </Typography>
+              </Box>
+            </Box>
+            <LinearProgress variant="determinate" value={Math.max(0, Math.min(item.percent, 100))} sx={getProgressBarSx(theme, item.color, muted)} />
+            {item.isCollapsedOther && isExpanded && item.hiddenItems?.length ? (
+              <Box
+                sx={{
+                  mt: 1.25,
+                  ml: { xs: 1.5, sm: 2 },
+                  pl: 1.5,
+                  borderLeft: `2px dashed ${alpha(item.color, theme.palette.mode === 'dark' ? 0.4 : 0.3)}`,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 1.25
+                }}
+              >
+                {item.hiddenItems.map((hiddenItem) => (
+                  <Box key={`${item.key}-${hiddenItem.key}`}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, mb: 0.5 }}>
+                      <Tooltip title={hiddenItem.tooltip || hiddenItem.label} arrow>
+                        <Box
+                          sx={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 0.75,
+                            minWidth: 0,
+                            color: 'text.secondary'
+                          }}
+                        >
+                          {hiddenItem.marker ? <Typography sx={{ fontSize: '1rem', lineHeight: 1 }}>{hiddenItem.marker}</Typography> : null}
+                          <Typography
+                            component="div"
+                            variant="caption"
+                            sx={{
+                              color: 'inherit',
+                              fontWeight: 600,
+                              minWidth: 0,
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap'
+                            }}
+                          >
+                            {labelFormatter ? labelFormatter(hiddenItem, false) : hiddenItem.label}
+                          </Typography>
+                        </Box>
+                      </Tooltip>
+                      <Typography variant="caption" sx={{ color: 'text.secondary', flexShrink: 0 }}>
+                        {valueFormatter ? valueFormatter(hiddenItem.count, hiddenItem) : hiddenItem.count.toLocaleString()}
+                        {detailFormatter ? ` · ${detailFormatter(hiddenItem)}` : ''} · {hiddenItem.percent.toFixed(1)}{percentSuffix}
+                      </Typography>
+                    </Box>
+                    <LinearProgress
+                      variant="determinate"
+                      value={Math.max(0, Math.min(hiddenItem.percent, 100))}
+                      sx={getProgressBarSx(theme, hiddenItem.color || item.color, true)}
+                    />
+                  </Box>
+                ))}
+              </Box>
+            ) : null}
+          </Box>
+        );
+
+        return item.tooltip ? (
+          <Tooltip title={item.tooltip} arrow key={item.key}>
+            <Box>{content}</Box>
+          </Tooltip>
+        ) : (
+          content
+        );
+      })}
+    </Box>
+  );
+};
+
+const QualityMetricRow = ({ label, count, percent, color, tooltip }) => {
+  const theme = useTheme();
+  const row = (
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1.5, mb: 0.75 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+          <Box
+            sx={{
+              width: 10,
+              height: 10,
+              borderRadius: '50%',
+              bgcolor: color,
+              flexShrink: 0,
+              boxShadow: `0 0 0 4px ${alpha(color, theme.palette.mode === 'dark' ? 0.18 : 0.12)}`
+            }}
+          />
+          <Typography variant="subtitle2" sx={{ fontWeight: 600, minWidth: 0 }}>
+            {label}
+          </Typography>
+        </Box>
+        <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75, flexShrink: 0 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+            {count.toLocaleString()}
+          </Typography>
+          <Typography variant="caption" sx={{ color: 'text.secondary', minWidth: 42, textAlign: 'right' }}>
+            {percent.toFixed(1)}%
+          </Typography>
+        </Box>
+      </Box>
+      <LinearProgress variant="determinate" value={Math.max(0, Math.min(percent, 100))} sx={getProgressBarSx(theme, color)} />
+    </Box>
+  );
+
+  return tooltip ? (
+    <Tooltip title={tooltip} arrow>
+      <Box>{row}</Box>
+    </Tooltip>
+  ) : (
+    row
+  );
+};
+
+const IPQualityBreakdown = ({ stats, loading }) => {
+  const theme = useTheme();
+
+  if (loading) {
+    return <StatRowsSkeleton rows={5} />;
+  }
+
+  if (!stats || !Array.isArray(stats.ipStats) || stats.ipStats.length === 0) {
+    return (
+      <Typography color="text.secondary" sx={{ fontSize: '0.875rem' }}>
+        暂无 IP 质量统计数据
+      </Typography>
+    );
+  }
+
+  const total = stats.total || 0;
+  const successTotal = stats.successTotal || 0;
+  const findCount = (key) => stats.ipStats.find((item) => item.key === key)?.count || 0;
+
+  const residentialRows = [
+    { key: 'housing', label: '住房IP', count: findCount('housing'), color: '#22c55e' },
+    { key: 'datacenter', label: '机房IP', count: findCount('datacenter'), color: '#64748b' }
+  ];
+  const typeRows = [
+    { key: 'native', label: '原生IP', count: findCount('native'), color: '#06b6d4' },
+    { key: 'broadcast', label: '广播IP', count: findCount('broadcast'), color: '#f59e0b' }
+  ];
+  const otherCount = findCount('other');
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.25 }}>
+      <Box>
+        <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.25, fontWeight: 600 }}>
+          住宅属性
+        </Typography>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+          {residentialRows.map((item) => (
+            <QualityMetricRow
+              key={item.key}
+              label={item.label}
+              count={item.count}
+              percent={successTotal > 0 ? (item.count / successTotal) * 100 : 0}
+              color={item.color}
+            />
+          ))}
+        </Box>
+      </Box>
+
+      <Box
+        sx={{
+          pt: 2,
+          borderTop: `1px solid ${alpha(theme.palette.text.primary, theme.palette.mode === 'dark' ? 0.08 : 0.06)}`
+        }}
+      >
+        <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.25, fontWeight: 600 }}>
+          IP 类型
+        </Typography>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+          {typeRows.map((item) => (
+            <QualityMetricRow
+              key={item.key}
+              label={item.label}
+              count={item.count}
+              percent={successTotal > 0 ? (item.count / successTotal) * 100 : 0}
+              color={item.color}
+            />
+          ))}
+        </Box>
+      </Box>
+
+      <Box
+        sx={{
+          p: 1.5,
+          borderRadius: 3,
+          bgcolor: alpha('#94a3b8', theme.palette.mode === 'dark' ? 0.12 : 0.08),
+          border: `1px solid ${alpha('#94a3b8', theme.palette.mode === 'dark' ? 0.24 : 0.16)}`
+        }}
+      >
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1.5 }}>
+          <Box>
+            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+              其他数量
+            </Typography>
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              非完整结果，未纳入细分 IP 判断
+            </Typography>
+          </Box>
+          <Box sx={{ textAlign: 'right' }}>
+            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+              {otherCount.toLocaleString()}
+            </Typography>
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              {total > 0 ? ((otherCount / total) * 100).toFixed(1) : '0.0'}%
+            </Typography>
+          </Box>
+        </Box>
+      </Box>
+    </Box>
+  );
+};
 
 // ==============================|| 问候语计算 ||============================== //
 
@@ -190,7 +693,7 @@ const PremiumStatCard = ({ title, value, subValue, loading, icon: Icon, gradient
               variant="h1"
               sx={{
                 fontWeight: 700,
-                fontSize: isNodeStat ? '1.75rem' : '2.25rem',
+                fontSize: subValue ? '1.75rem' : '2.25rem',
                 color: theme.palette.text.primary,
                 lineHeight: 1.2
               }}
@@ -205,7 +708,7 @@ const PremiumStatCard = ({ title, value, subValue, loading, icon: Icon, gradient
             </Typography>
 
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 1 }}>
-              {isNodeStat && subValue ? (
+              {subValue ? (
                 <Tooltip title={subValue} arrow placement="bottom">
                   <Typography
                     variant="caption"
@@ -220,7 +723,7 @@ const PremiumStatCard = ({ title, value, subValue, loading, icon: Icon, gradient
                       display: 'block'
                     }}
                   >
-                    📍 {subValue}
+                    {isNodeStat ? `📍 ${subValue}` : subValue}
                   </Typography>
                 </Tooltip>
               ) : (
@@ -759,16 +1262,17 @@ const ReleaseCard = ({ release }) => {
 export default function DashboardDefault() {
   const theme = useTheme();
   const isDark = theme.palette.mode === 'dark';
-  const [subTotal, setSubTotal] = useState(0);
+  const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
   const [nodeTotal, setNodeTotal] = useState(0);
   const [nodeAvailable, setNodeAvailable] = useState(0);
   const [fastestNode, setFastestNode] = useState(null);
   const [lowestDelayNode, setLowestDelayNode] = useState(null);
-  const [countryStats, setCountryStats] = useState({});
+  const [countryStats, setCountryStats] = useState([]);
   const [protocolStats, setProtocolStats] = useState({});
   const [tagStats, setTagStats] = useState([]);
   const [groupStats, setGroupStats] = useState({});
   const [sourceStats, setSourceStats] = useState({});
+  const [qualityStats, setQualityStats] = useState(null);
   const [releases, setReleases] = useState([]);
   const [airports, setAirports] = useState([]);
   const [loadingStats, setLoadingStats] = useState(true);
@@ -786,20 +1290,19 @@ export default function DashboardDefault() {
   const fetchStats = async () => {
     try {
       setLoadingStats(true);
-      const [subRes, nodeRes, fastestRes, lowestDelayRes, countryRes, protocolRes, tagRes, groupRes, sourceRes, airportRes] =
+      const [nodeRes, fastestRes, lowestDelayRes, countryRes, protocolRes, tagRes, groupRes, sourceRes, qualityRes, airportRes] =
         await Promise.all([
-          getSubTotal(),
           getNodeTotal(),
           getFastestSpeedNode(),
           getLowestDelayNode(),
-          getCountryStats(),
+          getDashboardCountryStats(),
           getProtocolStats(),
           getTagStats(),
           getGroupStats(),
           getSourceStats(),
+          getQualityStats(),
           getAirports()
         ]);
-      setSubTotal(subRes.data || 0);
       // nodeRes.data 现在返回 { total, available }
       if (nodeRes.data && typeof nodeRes.data === 'object') {
         setNodeTotal(nodeRes.data.total || 0);
@@ -810,11 +1313,12 @@ export default function DashboardDefault() {
       }
       setFastestNode(fastestRes.data || null);
       setLowestDelayNode(lowestDelayRes.data || null);
-      setCountryStats(countryRes.data || {});
+      setCountryStats(countryRes.data || []);
       setProtocolStats(protocolRes.data || {});
       setTagStats(tagRes.data || []);
       setGroupStats(groupRes.data || {});
       setSourceStats(sourceRes.data || {});
+      setQualityStats(qualityRes.data || null);
       setAirports(airportRes.data?.list || airportRes.data || []);
     } catch (error) {
       console.error('获取统计数据失败:', error);
@@ -847,9 +1351,10 @@ export default function DashboardDefault() {
   // 统计卡片配置
   const statsConfig = [
     {
-      title: '订阅总数',
-      value: subTotal,
-      icon: SubscriptionsIcon,
+      title: '机场总数',
+      value: airports.length,
+      subValue: `${airports.filter((airport) => airport.fetchUsageInfo).length} 个已启用用量获取`,
+      icon: FlightTakeoffIcon,
       gradientColors: ['#6366f1', '#8b5cf6'],
       accentColor: '#6366f1'
     },
@@ -884,6 +1389,95 @@ export default function DashboardDefault() {
     }
   ];
 
+  const distributionLimit = isMobile ? 4 : 5;
+  const countryStatsMap = useMemo(() => createCountryStatMap(countryStats), [countryStats]);
+  const unknownCountryStat = countryStatsMap['未知'] || null;
+  const countryDistributionSource = useMemo(() => countryStats.filter((item) => item.country !== '未知'), [countryStats]);
+
+  const countryDistribution = useMemo(
+    () =>
+      normalizeMapStats({
+        entries: countryDistributionSource.map((item) => [item.country, item.nodeCount]),
+        limit: distributionLimit,
+        defaultColor: '#6366f1',
+        getItemMeta: (country) => ({
+          marker: getFlagEmoji(country),
+          uniqueIpCount: countryStatsMap[country]?.uniqueIpCount || 0,
+          tooltip: `节点 ${countryStatsMap[country]?.nodeCount || 0}，可用IP ${countryStatsMap[country]?.uniqueIpCount || 0}`
+        })
+      }),
+    [countryDistributionSource, countryStatsMap, distributionLimit]
+  );
+
+  const protocolDistribution = useMemo(
+    () =>
+      normalizeMapStats({
+        entries: Object.entries(protocolStats),
+        limit: distributionLimit,
+        defaultColor: '#10b981',
+        getItemMeta: (protocolName) => ({
+          color: protocolColors[protocolName]?.[0] || '#10b981'
+        })
+      }),
+    [protocolStats, distributionLimit]
+  );
+
+  const tagDistribution = useMemo(() => normalizeTagStats({ tags: tagStats, limit: distributionLimit }), [tagStats, distributionLimit]);
+
+  const groupDistribution = useMemo(
+    () =>
+      normalizeMapStats({
+        entries: Object.entries(groupStats),
+        limit: distributionLimit,
+        defaultColor: '#8b5cf6'
+      }),
+    [groupStats, distributionLimit]
+  );
+
+  const sourceDistribution = useMemo(
+    () =>
+      normalizeMapStats({
+        entries: Object.entries(sourceStats),
+        limit: distributionLimit,
+        defaultColor: '#f97316'
+      }),
+    [sourceStats, distributionLimit]
+  );
+
+  const qualityStatusDistribution = useMemo(() => {
+    const items = (qualityStats?.qualityStatus || [])
+      .map((item) => {
+        const meta = getQualityStatusMeta(item.key);
+        return {
+          key: item.key,
+          label: qualityStatusLabelMap[item.key] || meta.label || item.label,
+          count: item.count,
+          color: qualityStatusColorMap[item.key] || '#64748b',
+          tooltip: meta.tooltip
+        };
+      })
+      .filter((item) => item.count > 0)
+      .map((item) => ({
+        ...item,
+        percent: (qualityStats?.total || 0) > 0 ? (item.count / qualityStats.total) * 100 : 0
+      }));
+
+    const order = ['success', 'partial', 'failed', 'disabled', 'untested'];
+    return order.map((key) => items.find((item) => item.key === key)).filter(Boolean);
+  }, [qualityStats]);
+
+  const fraudDistribution = useMemo(
+    () =>
+      (qualityStats?.fraudScoreStats || []).map((item) => ({
+        key: item.key,
+        label: item.label,
+        count: item.count,
+        color: fraudLevelColors[item.label.split(' ')[0]] || '#f59e0b',
+        percent: (qualityStats?.successTotal || 0) > 0 ? (item.count / qualityStats.successTotal) * 100 : 0
+      })),
+    [qualityStats]
+  );
+
   return (
     <Box sx={{ pb: 3 }}>
       {/* 欢迎横幅 */}
@@ -916,388 +1510,202 @@ export default function DashboardDefault() {
       {/* 机场流量概览卡片 */}
       <AirportUsageCard airports={airports} loading={loadingStats} />
 
-      {/* 国家和协议统计 */}
       <Grid container spacing={3} sx={{ mb: 4, alignItems: 'stretch' }}>
-        {/* 国家统计卡片 */}
         <Grid size={{ xs: 12, md: 6 }}>
-          <Card
-            sx={{
-              ...getCalmSurface(theme, '#6366f1'),
-              borderRadius: 4,
-              height: '100%',
-              overflow: 'hidden',
-              position: 'relative',
-              '&::before': {
-                content: '""',
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                height: 3,
-                backgroundColor: '#6366f1'
-              }
-            }}
+          <StatsChartCard
+            title="节点国家分布"
+            icon={PublicIcon}
+            accentColor="#6366f1"
+            summary={`${countryDistributionSource.length} 个地区`}
+            loading={loadingStats}
+            tooltip="按节点落地国家聚合，仅比较真实地区分布；未知节点数量单独展示。"
           >
-            <CardContent sx={{ p: 3 }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2.5 }}>
-                <Box sx={getAccentIconBox(theme, '#6366f1')}>
-                  <PublicIcon sx={{ fontSize: 22 }} />
-                </Box>
-                <Typography variant="h5" sx={{ fontWeight: 600 }}>
-                  节点国家分布
-                </Typography>
-              </Box>
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}>
+              <RankedStatList
+                items={countryDistribution}
+                emptyText="暂无国家统计数据"
+                detailFormatter={(item) => `可用IP ${item.uniqueIpCount || 0}`}
+                labelFormatter={(item) => {
+                  if (item.key === 'collapsed-other') {
+                    return '其他地区（可展开查看）';
+                  }
 
-              {loadingStats ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {[1, 2, 3, 4, 5].map((i) => (
-                    <Skeleton key={i} variant="rounded" width={80} height={36} sx={{ borderRadius: 2 }} />
-                  ))}
+                  return (
+                    <Box component="span" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {item.label}
+                    </Box>
+                  );
+                }}
+              />
+
+              {!loadingStats && unknownCountryStat ? (
+                <Box
+                  sx={{
+                    p: 1.5,
+                    borderRadius: 3,
+                    bgcolor: alpha('#94a3b8', theme.palette.mode === 'dark' ? 0.12 : 0.08),
+                    border: `1px solid ${alpha('#94a3b8', theme.palette.mode === 'dark' ? 0.24 : 0.16)}`
+                  }}
+                >
+                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1.5 }}>
+                    <Box>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        未知节点
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                        未获取到落地国家或节点已失效，不参与地区比较
+                      </Typography>
+                    </Box>
+                    <Box sx={{ textAlign: 'right' }}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        {unknownCountryStat.nodeCount.toLocaleString()}
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                        可用IP {unknownCountryStat.uniqueIpCount || 0}
+                      </Typography>
+                    </Box>
+                  </Box>
                 </Box>
-              ) : Object.keys(countryStats).length > 0 ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {Object.entries(countryStats)
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([country, count]) => {
-                      // 国家代码转国旗 emoji
-                      const getFlagEmoji = (code) => {
-                        if (!code || code === '未知') return '🌐';
-                        code = code.toUpperCase() === 'TW' ? 'CN' : code;
-                        const codePoints = code
-                          .toUpperCase()
-                          .split('')
-                          .map((char) => 127397 + char.charCodeAt(0));
-                        return String.fromCodePoint(...codePoints);
-                      };
-                      return (
-                        <Chip
-                          key={country}
-                          label={
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                              <Typography sx={{ fontSize: '1rem' }}>{getFlagEmoji(country)}</Typography>
-                              <Typography sx={{ fontWeight: 600, fontSize: '0.8rem' }}>{country}</Typography>
-                              <Typography sx={{ color: 'text.secondary', fontSize: '0.75rem', ml: 0.5 }}>({count})</Typography>
-                            </Box>
-                          }
-                          sx={{
-                            ...getAccentChipSx(theme, '#6366f1'),
-                            borderRadius: 2,
-                            height: 36
-                          }}
-                        />
-                      );
-                    })}
-                </Box>
-              ) : (
-                <Typography color="text.secondary" sx={{ fontSize: '0.875rem' }}>
-                  暂无国家统计数据
-                </Typography>
-              )}
-            </CardContent>
-          </Card>
+              ) : null}
+            </Box>
+          </StatsChartCard>
         </Grid>
 
-        {/* 协议统计卡片 */}
         <Grid size={{ xs: 12, md: 6 }}>
-          <Card
-            sx={{
-              ...getCalmSurface(theme, '#10b981'),
-              borderRadius: 4,
-              height: '100%',
-              overflow: 'hidden',
-              position: 'relative',
-              '&::before': {
-                content: '""',
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                height: 3,
-                backgroundColor: '#10b981'
-              }
-            }}
+          <StatsChartCard
+            title="节点协议分布"
+            icon={SecurityIcon}
+            accentColor="#10b981"
+            summary={`${Object.keys(protocolStats).length} 种协议`}
+            loading={loadingStats}
+            tooltip="按协议类型统计，便于快速判断节点结构。"
           >
-            <CardContent sx={{ p: 3 }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2.5 }}>
-                <Box sx={getAccentIconBox(theme, '#10b981')}>
-                  <SecurityIcon sx={{ fontSize: 22 }} />
-                </Box>
-                <Typography variant="h5" sx={{ fontWeight: 600 }}>
-                  节点协议分布
-                </Typography>
-              </Box>
-
-              {loadingStats ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {[1, 2, 3, 4].map((i) => (
-                    <Skeleton key={i} variant="rounded" width={100} height={36} sx={{ borderRadius: 2 }} />
-                  ))}
-                </Box>
-              ) : Object.keys(protocolStats).length > 0 ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {Object.entries(protocolStats)
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([protocol, count]) => {
-                      // 协议颜色映射
-                      const protocolColors = {
-                        Shadowsocks: ['#3b82f6', '#2563eb'],
-                        ShadowsocksR: ['#6366f1', '#4f46e5'],
-                        VMess: ['#8b5cf6', '#7c3aed'],
-                        VLESS: ['#10b981', '#059669'],
-                        Trojan: ['#ef4444', '#dc2626'],
-                        Hysteria: ['#06b6d4', '#0891b2'],
-                        Hysteria2: ['#14b8a6', '#0d9488'],
-                        TUIC: ['#f59e0b', '#d97706'],
-                        WireGuard: ['#84cc16', '#65a30d'],
-                        NaiveProxy: ['#ec4899', '#db2777'],
-                        SOCKS5: ['#64748b', '#475569'],
-                        HTTP: ['#94a3b8', '#64748b'],
-                        HTTPS: ['#22c55e', '#16a34a']
-                      };
-                      const colors = protocolColors[protocol] || ['#6b7280', '#4b5563'];
-
-                      return (
-                        <Chip
-                          key={protocol}
-                          label={
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                              <Box
-                                sx={{
-                                  width: 8,
-                                  height: 8,
-                                  borderRadius: '50%',
-                                  background: `linear-gradient(135deg, ${colors[0]} 0%, ${colors[1]} 100%)`
-                                }}
-                              />
-                              <Typography sx={{ fontWeight: 600, fontSize: '0.8rem' }}>{protocol}</Typography>
-                              <Typography sx={{ color: 'text.secondary', fontSize: '0.75rem', ml: 0.5 }}>({count})</Typography>
-                            </Box>
-                          }
-                          sx={{
-                            ...getAccentChipSx(theme, colors[0]),
-                            borderRadius: 2,
-                            height: 36
-                          }}
-                        />
-                      );
-                    })}
-                </Box>
-              ) : (
-                <Typography color="text.secondary" sx={{ fontSize: '0.875rem' }}>
-                  暂无协议统计数据
-                </Typography>
-              )}
-            </CardContent>
-          </Card>
+            <RankedStatList
+              items={protocolDistribution}
+              emptyText="暂无协议统计数据"
+              labelFormatter={(item) => (item.key === 'collapsed-other' ? '其他（可展开查看）' : item.label)}
+            />
+          </StatsChartCard>
         </Grid>
       </Grid>
 
-      {/* 标签、分组、来源统计 */}
       <Grid container spacing={3} sx={{ mb: 4, alignItems: 'stretch' }}>
-        {/* 标签统计卡片 */}
         <Grid size={{ xs: 12, md: 4 }}>
-          <Card
-            sx={{
-              ...getCalmSurface(theme, '#ec4899'),
-              borderRadius: 4,
-              height: '100%',
-              overflow: 'hidden',
-              position: 'relative',
-              '&::before': {
-                content: '""',
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                height: 3,
-                backgroundColor: '#ec4899'
-              }
-            }}
+          <StatsChartCard
+            title="标签统计"
+            icon={LabelIcon}
+            accentColor="#ec4899"
+            summary={`${tagStats.length} 个标签`}
+            loading={loadingStats}
+            tooltip="展示命中最多的标签，便于识别规则覆盖情况。"
           >
-            <CardContent sx={{ p: 3 }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2.5 }}>
-                <Box sx={getAccentIconBox(theme, '#ec4899')}>
-                  <LabelIcon sx={{ fontSize: 22 }} />
-                </Box>
-                <Typography variant="h5" sx={{ fontWeight: 600 }}>
-                  标签统计
-                </Typography>
-              </Box>
-
-              {loadingStats ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {[1, 2, 3].map((i) => (
-                    <Skeleton key={i} variant="rounded" width={80} height={36} sx={{ borderRadius: 2 }} />
-                  ))}
-                </Box>
-              ) : tagStats.length > 0 ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {tagStats
-                    .sort((a, b) => b.count - a.count)
-                    .map((tag) => (
-                      <Chip
-                        key={tag.name}
-                        label={
-                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                            <Box
-                              sx={{
-                                width: 10,
-                                height: 10,
-                                borderRadius: '50%',
-                                bgcolor: tag.color
-                              }}
-                            />
-                            <Typography sx={{ fontWeight: 600, fontSize: '0.8rem' }}>{tag.name}</Typography>
-                            <Typography sx={{ color: 'text.secondary', fontSize: '0.75rem', ml: 0.5 }}>({tag.count})</Typography>
-                          </Box>
-                        }
-                        sx={{
-                          ...getAccentChipSx(theme, tag.color),
-                          borderRadius: 2,
-                          height: 36
-                        }}
-                      />
-                    ))}
-                </Box>
-              ) : (
-                <Typography color="text.secondary" sx={{ fontSize: '0.875rem' }}>
-                  暂无标签统计数据
-                </Typography>
-              )}
-            </CardContent>
-          </Card>
+            <RankedStatList
+              items={tagDistribution}
+              emptyText="暂无标签统计数据"
+              labelFormatter={(item) => (item.key === 'collapsed-other' ? '其他（可展开查看）' : item.label)}
+            />
+          </StatsChartCard>
         </Grid>
 
-        {/* 分组统计卡片 */}
         <Grid size={{ xs: 12, md: 4 }}>
-          <Card
-            sx={{
-              ...getCalmSurface(theme, '#8b5cf6'),
-              borderRadius: 4,
-              height: '100%',
-              overflow: 'hidden',
-              position: 'relative',
-              '&::before': {
-                content: '""',
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                height: 3,
-                backgroundColor: '#8b5cf6'
-              }
-            }}
+          <StatsChartCard
+            title="分组统计"
+            icon={FolderIcon}
+            accentColor="#8b5cf6"
+            summary={`${Object.keys(groupStats).length} 个分组`}
+            loading={loadingStats}
+            tooltip="按节点分组聚合，方便查看主要组织结构。"
           >
-            <CardContent sx={{ p: 3 }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2.5 }}>
-                <Box sx={getAccentIconBox(theme, '#8b5cf6')}>
-                  <FolderIcon sx={{ fontSize: 22 }} />
-                </Box>
-                <Typography variant="h5" sx={{ fontWeight: 600 }}>
-                  分组统计
-                </Typography>
-              </Box>
-
-              {loadingStats ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {[1, 2, 3].map((i) => (
-                    <Skeleton key={i} variant="rounded" width={80} height={36} sx={{ borderRadius: 2 }} />
-                  ))}
-                </Box>
-              ) : Object.keys(groupStats).length > 0 ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {Object.entries(groupStats)
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([group, count]) => (
-                      <Chip
-                        key={group}
-                        label={
-                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                            <Typography sx={{ fontWeight: 600, fontSize: '0.8rem' }}>{group}</Typography>
-                            <Typography sx={{ color: 'text.secondary', fontSize: '0.75rem', ml: 0.5 }}>({count})</Typography>
-                          </Box>
-                        }
-                        sx={{
-                          ...getAccentChipSx(theme, '#8b5cf6'),
-                          borderRadius: 2,
-                          height: 36
-                        }}
-                      />
-                    ))}
-                </Box>
-              ) : (
-                <Typography color="text.secondary" sx={{ fontSize: '0.875rem' }}>
-                  暂无分组统计数据
-                </Typography>
-              )}
-            </CardContent>
-          </Card>
+            <RankedStatList
+              items={groupDistribution}
+              emptyText="暂无分组统计数据"
+              labelFormatter={(item) => (item.key === 'collapsed-other' ? '其他（可展开查看）' : item.label)}
+            />
+          </StatsChartCard>
         </Grid>
 
-        {/* 来源统计卡片 */}
         <Grid size={{ xs: 12, md: 4 }}>
-          <Card
-            sx={{
-              ...getCalmSurface(theme, '#f97316'),
-              borderRadius: 4,
-              height: '100%',
-              overflow: 'hidden',
-              position: 'relative',
-              '&::before': {
-                content: '""',
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                height: 3,
-                backgroundColor: '#f97316'
-              }
-            }}
+          <StatsChartCard
+            title="来源统计"
+            icon={SourceIcon}
+            accentColor="#f97316"
+            summary={`${Object.keys(sourceStats).length} 个来源`}
+            loading={loadingStats}
+            tooltip="展示节点主要来源，便于识别上游贡献占比。"
           >
-            <CardContent sx={{ p: 3 }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 2.5 }}>
-                <Box sx={getAccentIconBox(theme, '#f97316')}>
-                  <SourceIcon sx={{ fontSize: 22 }} />
-                </Box>
-                <Typography variant="h5" sx={{ fontWeight: 600 }}>
-                  来源统计
-                </Typography>
-              </Box>
+            <RankedStatList
+              items={sourceDistribution}
+              emptyText="暂无来源统计数据"
+              labelFormatter={(item) => (item.key === 'collapsed-other' ? '其他（可展开查看）' : item.label)}
+            />
+          </StatsChartCard>
+        </Grid>
+      </Grid>
 
-              {loadingStats ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {[1, 2, 3].map((i) => (
-                    <Skeleton key={i} variant="rounded" width={80} height={36} sx={{ borderRadius: 2 }} />
-                  ))}
+      <Grid container spacing={3} sx={{ mb: 4, alignItems: 'stretch' }}>
+        <Grid size={{ xs: 12, md: 4 }}>
+          <StatsChartCard
+            title="质量状态统计"
+            icon={AutoAwesomeIcon}
+            accentColor="#0ea5e9"
+            summary={`${qualityStats?.successTotal || 0}/${qualityStats?.total || 0} 可细分`}
+            loading={loadingStats}
+            tooltip="完整结果可参与 IP 和欺诈评分细分，其余状态用于说明覆盖率。"
+          >
+            <RankedStatList items={qualityStatusDistribution} emptyText="暂无质量状态统计数据" />
+          </StatsChartCard>
+        </Grid>
+
+        <Grid size={{ xs: 12, md: 4 }}>
+          <StatsChartCard
+            title="IP 质量统计"
+            icon={CloudQueueIcon}
+            accentColor="#06b6d4"
+            summary={`完整结果 ${qualityStats?.successTotal || 0}`}
+            loading={loadingStats}
+            tooltip="住房/机房与原生/广播基于完整质量检测结果统计，其他数量表示未完成细分的节点。"
+          >
+            <IPQualityBreakdown stats={qualityStats} loading={loadingStats} />
+          </StatsChartCard>
+        </Grid>
+
+        <Grid size={{ xs: 12, md: 4 }}>
+          <StatsChartCard
+            title="欺诈评分分布"
+            icon={WarningAmberIcon}
+            accentColor="#f59e0b"
+            summary={`完整结果 ${qualityStats?.successTotal || 0}`}
+            loading={loadingStats}
+            tooltip={`按系统现有欺诈评分分级方式统计，另有 ${qualityStats?.otherTotal || 0} 个节点未纳入评分分桶。`}
+          >
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}>
+              <RankedStatList items={fraudDistribution} emptyText="暂无欺诈评分统计数据" />
+              {!loadingStats && (qualityStats?.otherTotal || 0) > 0 ? (
+                <Box
+                  sx={{
+                    p: 1.5,
+                    borderRadius: 3,
+                    bgcolor: alpha('#94a3b8', theme.palette.mode === 'dark' ? 0.12 : 0.08),
+                    border: `1px solid ${alpha('#94a3b8', theme.palette.mode === 'dark' ? 0.24 : 0.16)}`
+                  }}
+                >
+                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1.5 }}>
+                    <Box>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                        未纳入评分
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                        质量状态不是完整结果
+                      </Typography>
+                    </Box>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                      {(qualityStats?.otherTotal || 0).toLocaleString()}
+                    </Typography>
+                  </Box>
                 </Box>
-              ) : Object.keys(sourceStats).length > 0 ? (
-                <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-                  {Object.entries(sourceStats)
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([source, count]) => (
-                      <Chip
-                        key={source}
-                        label={
-                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                            <Typography sx={{ fontWeight: 600, fontSize: '0.8rem' }}>{source}</Typography>
-                            <Typography sx={{ color: 'text.secondary', fontSize: '0.75rem', ml: 0.5 }}>({count})</Typography>
-                          </Box>
-                        }
-                        sx={{
-                          ...getAccentChipSx(theme, '#f97316'),
-                          borderRadius: 2,
-                          height: 36
-                        }}
-                      />
-                    ))}
-                </Box>
-              ) : (
-                <Typography color="text.secondary" sx={{ fontSize: '0.875rem' }}>
-                  暂无来源统计数据
-                </Typography>
-              )}
-            </CardContent>
-          </Card>
+              ) : null}
+            </Box>
+          </StatsChartCard>
         </Grid>
       </Grid>
 
