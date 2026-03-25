@@ -45,6 +45,7 @@ import {
   batchUpdateNodeCountry,
   getProtocolUIMeta
 } from 'api/nodes';
+import { getNodeCheckMeta } from 'api/nodeCheck';
 import { getTags, batchSetNodeTags, batchRemoveNodeTags } from 'api/tags';
 
 // local components
@@ -68,7 +69,7 @@ import {
 } from './component';
 
 // utils
-import { SPEED_TEST_TCP_OPTIONS, SPEED_TEST_MIHOMO_OPTIONS } from './utils';
+import { buildUnlockRulesPayload, setUnlockMeta, SPEED_TEST_TCP_OPTIONS, SPEED_TEST_MIHOMO_OPTIONS } from './utils';
 
 // ==============================|| 节点管理 ||============================== //
 
@@ -169,6 +170,8 @@ export default function NodeList() {
   const [residentialType, setResidentialType] = useState('');
   const [ipType, setIpType] = useState('');
   const [qualityStatus, setQualityStatus] = useState('');
+  const [unlockRules, setUnlockRules] = useState([]);
+  const [unlockRuleMode, setUnlockRuleMode] = useState('or');
 
   // 排序
   const [sortBy, setSortBy] = useState(''); // 'delay' | 'speed' | ''
@@ -284,6 +287,10 @@ export default function NodeList() {
       if (filterParams.residentialType) params.residentialType = filterParams.residentialType;
       if (filterParams.ipType) params.ipType = filterParams.ipType;
       if (filterParams.qualityStatus) params.qualityStatus = filterParams.qualityStatus;
+      if (filterParams.unlockRules?.some((rule) => rule.provider || rule.status || rule.keyword)) {
+        params.unlockRules = buildUnlockRulesPayload(filterParams.unlockRules);
+        params.unlockRuleMode = filterParams.unlockRuleMode || 'or';
+      }
       if (filterParams.countries && filterParams.countries.length > 0) {
         params['countries[]'] = filterParams.countries;
       }
@@ -378,6 +385,11 @@ export default function NodeList() {
         setProtocolOptions(res.data || []);
       })
       .catch(console.error);
+    getNodeCheckMeta()
+      .then((res) => {
+        setUnlockMeta(res.data || {});
+      })
+      .catch(console.error);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -412,6 +424,8 @@ export default function NodeList() {
         residentialType: residentialType,
         ipType: ipType,
         qualityStatus: qualityStatus,
+        unlockRules: unlockRules,
+        unlockRuleMode: unlockRuleMode,
         countries: countryFilter,
         tags: tagFilter,
         sortBy: sortBy,
@@ -442,6 +456,8 @@ export default function NodeList() {
     residentialType,
     ipType,
     qualityStatus,
+    unlockRules,
+    unlockRuleMode,
     countryFilter,
     tagFilter,
     sortBy,
@@ -474,6 +490,8 @@ export default function NodeList() {
     setResidentialType('');
     setIpType('');
     setQualityStatus('');
+    setUnlockRules([]);
+    setUnlockRuleMode('or');
     setSortBy('');
     setSortOrder('asc');
   };
@@ -491,6 +509,8 @@ export default function NodeList() {
     residentialType: residentialType,
     ipType: ipType,
     qualityStatus: qualityStatus,
+    unlockRules: unlockRules,
+    unlockRuleMode: unlockRuleMode,
     countries: countryFilter,
     tags: tagFilter,
     sortBy: sortBy,
@@ -560,6 +580,8 @@ export default function NodeList() {
     residentialType,
     ipType,
     qualityStatus,
+    unlockRules,
+    unlockRuleMode,
     sortBy,
     sortOrder,
     page,
@@ -950,6 +972,10 @@ export default function NodeList() {
         if (filters.residentialType) params.residentialType = filters.residentialType;
         if (filters.ipType) params.ipType = filters.ipType;
         if (filters.qualityStatus) params.qualityStatus = filters.qualityStatus;
+        if (filters.unlockRules?.some((rule) => rule.provider || rule.status || rule.keyword)) {
+          params.unlockRules = buildUnlockRulesPayload(filters.unlockRules);
+          params.unlockRuleMode = filters.unlockRuleMode || 'or';
+        }
         if (filters.countries && filters.countries.length > 0) {
           params['countries[]'] = filters.countries;
         }
@@ -1107,6 +1133,10 @@ export default function NodeList() {
         setIpType={setIpType}
         qualityStatus={qualityStatus}
         setQualityStatus={setQualityStatus}
+        unlockRules={unlockRules}
+        setUnlockRules={setUnlockRules}
+        unlockRuleMode={unlockRuleMode}
+        setUnlockRuleMode={setUnlockRuleMode}
         countryFilter={countryFilter}
         setCountryFilter={setCountryFilter}
         tagFilter={tagFilter}
